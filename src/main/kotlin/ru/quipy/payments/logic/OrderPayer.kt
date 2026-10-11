@@ -1,5 +1,6 @@
 package ru.quipy.payments.logic
 
+import jakarta.annotation.PostConstruct
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
@@ -26,6 +27,9 @@ class OrderPayer {
     @Autowired
     private lateinit var paymentService: PaymentService
 
+    @Autowired
+    private lateinit var paymentMetrics: PaymentMetrics
+
     private val paymentExecutor = ThreadPoolExecutor(
         16,
         16,
@@ -36,7 +40,13 @@ class OrderPayer {
         CallerBlockingRejectedExecutionHandler()
     )
 
+    @PostConstruct
+    fun registerMetrics() {
+        paymentMetrics.monitorQueue(paymentExecutor)
+    }
+
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
+        paymentMetrics.recordIncoming()
         val createdAt = System.currentTimeMillis()
         paymentExecutor.submit {
             val createdEvent = paymentESService.create {
