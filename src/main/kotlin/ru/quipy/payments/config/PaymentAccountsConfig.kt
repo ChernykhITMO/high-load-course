@@ -36,7 +36,7 @@ class PaymentAccountsConfig {
     lateinit var allowedAccounts: List<String>
 
     @Bean
-    fun accountAdapters(paymentService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>): List<PaymentExternalSystemAdapter> {
+    fun accountAdapters(paymentService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>, paymentMetrics: PaymentMetrics,): List<PaymentExternalSystemAdapter> {
         val request = HttpRequest.newBuilder()
             .uri(URI("http://${paymentProviderHostPort}/external/accounts?serviceName=$serviceName&token=$token"))
             .GET()
@@ -54,10 +54,11 @@ class PaymentAccountsConfig {
             .onEach(::println)
             .map {
                 PaymentExternalSystemAdapterImpl(
-                    it,
-                    paymentService,
-                    paymentProviderHostPort,
-                    token
+                    properties = it,
+                    paymentESService = paymentService,
+                    paymentProviderHostPort = paymentProviderHostPort,
+                    token = token,
+                    paymentMetrics = paymentMetrics,
                 )
             }
     }
