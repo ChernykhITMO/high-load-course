@@ -9,13 +9,16 @@ import ru.quipy.common.utils.CallerBlockingRejectedExecutionHandler
 import ru.quipy.common.utils.NamedThreadFactory
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
+import java.time.Duration
 import java.util.*
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 
 @Service
-class OrderPayer {
+class OrderPayer(
+    private val paymentAccounts: List<PaymentExternalSystemAdapter>,
+) {
 
     companion object {
         val logger: Logger = LoggerFactory.getLogger(OrderPayer::class.java)
@@ -30,14 +33,20 @@ class OrderPayer {
     @Autowired
     private lateinit var paymentMetrics: PaymentMetrics
 
+    // At 200 requests/s and a 3-second deadline, at most 600 payments can still be useful.
+    // Keep spare workers for event creation while provider calls occupy the allowed slots.
+    private val maxWorkerCount = (
+        paymentAccounts.sumOf { it.parallelRequests().toLong() } + 32L
+    ).coerceIn(64L, 632L).toInt()
+
     private val paymentExecutor = ThreadPoolExecutor(
-        16,
-        16,
-        0L,
-        TimeUnit.MILLISECONDS,
-        LinkedBlockingQueue(8_000),
+        64,
+        maxWorkerCount,
+        30L,
+        TimeUnit.SECONDS,
+        LinkedBlockingQueue(64),
         NamedThreadFactory("payment-submission-executor"),
-        CallerBlockingRejectedExecutionHandler()
+        CallerBlockingRejectedExecutionHandler(Duration.ofMillis(250))
     )
 
     @PostConstruct

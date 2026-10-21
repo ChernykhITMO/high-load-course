@@ -1,81 +1,56 @@
 package ru.quipy.common.utils
 
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.asCoroutineDispatcher
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
-import org.slf4j.Logger
-import org.slf4j.LoggerFactory
 import java.time.Duration
-import java.util.concurrent.Executors
-import java.util.concurrent.PriorityBlockingQueue
-import java.util.concurrent.atomic.AtomicLong
-import java.util.concurrent.locks.ReentrantLock
-import kotlin.concurrent.withLock
+import java.util.ArrayDeque
 
+/** Limits admissions in every rolling time window, including at window boundaries. */
 class SlidingWindowRateLimiter(
     private val rate: Long,
-    private val window: Duration,
+    window: Duration,
 ) : RateLimiter {
-    private val rateLimiterScope = CoroutineScope(Executors.newSingleThreadExecutor().asCoroutineDispatcher())
+    private val windowMillis = window.toMillis()
+    private val monitor = java.lang.Object()
+    private val admittedAt = ArrayDeque<Long>()
 
-    private val sum = AtomicLong(0)
-    private val queue = PriorityBlockingQueue<Measure>(10_000)
+    init {
+        require(rate > 0) { "Rate must be positive" }
+        require(windowMillis > 0) { "Window must be at least one millisecond" }
+    }
 
-    override fun tick(): Boolean {
-        while (true) {
-            val curSum = sum.get()
-            if (curSum >= rate) return false
-            if (sum.compareAndSet(curSum, curSum + 1)) {
-                queue.add(Measure(1, System.currentTimeMillis()))
-                return true
-            }
+    override fun tick(): Boolean = synchronized(monitor) {
+        val currentTime = System.currentTimeMillis()
+        discardExpired(currentTime)
+        if (admittedAt.size.toLong() >= rate) {
+            false
+        } else {
+            admittedAt.addLast(currentTime)
+            true
         }
     }
 
-    fun tickBlocking(deadlineMillis: Long): Boolean {
+    fun tickBlocking(deadlineMillis: Long): Boolean = synchronized(monitor) {
         while (true) {
-            val remainingMillis =
-                deadlineMillis - System.currentTimeMillis()
+            val currentTime = System.currentTimeMillis()
+            if (currentTime >= deadlineMillis) return@synchronized false
 
-            if (remainingMillis <= 0) {
-                return false
+            discardExpired(currentTime)
+            if (admittedAt.size.toLong() < rate) {
+                admittedAt.addLast(currentTime)
+                return@synchronized true
             }
 
-            if (tick()) {
-                return true
-            }
-
-            Thread.sleep(minOf(10L, remainingMillis))
+            val nextSlotAt = admittedAt.first + windowMillis
+            val waitMillis = minOf(deadlineMillis, nextSlotAt) - currentTime
+            monitor.wait(waitMillis.coerceAtLeast(1L))
         }
+
+        @Suppress("UNREACHABLE_CODE")
+        false
     }
 
-    data class Measure(
-        val value: Long,
-        val timestamp: Long
-    ) : Comparable<Measure> {
-        override fun compareTo(other: Measure): Int {
-            return timestamp.compareTo(other.timestamp)
+    private fun discardExpired(currentTime: Long) {
+        while (admittedAt.isNotEmpty() && currentTime - admittedAt.first >= windowMillis) {
+            admittedAt.removeFirst()
         }
-    }
-
-    private val releaseJob = rateLimiterScope.launch {
-        while (true) {
-            val head = queue.peek()
-            val winStart = System.currentTimeMillis() - window.toMillis()
-            if (head == null) {
-                delay(1L)
-                continue
-            }
-            if (head.timestamp > winStart) {
-                delay(head.timestamp - winStart)
-                continue
-            }
-            sum.addAndGet(-1)
-            queue.take()
-        }
-    }.invokeOnCompletion { th -> if (th != null) logger.error("Rate limiter release job completed", th) }
-    companion object {
-        private val logger: Logger = LoggerFactory.getLogger(SlidingWindowRateLimiter::class.java)
     }
 }

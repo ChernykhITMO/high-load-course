@@ -35,7 +35,6 @@ class PaymentExternalSystemAdapterImpl(
     private val serviceName = properties.serviceName
     private val accountName = properties.accountName
     private val requestAverageProcessingTime = properties.averageProcessingTime
-    private val paymentTimeReserveMillis = requestAverageProcessingTime.toMillis() * 2L
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
 
@@ -52,7 +51,14 @@ class PaymentExternalSystemAdapterImpl(
         paymentStartedAt: Long,
         deadline: Long,
     ) {
-        if (rejectIfTooLate(paymentId, paymentStartedAt, deadline)) {
+        // A short case deadline must not be exhausted by a reserve based on a slow account.
+        val totalBudgetMillis = (deadline - paymentStartedAt).coerceAtLeast(0L)
+        val paymentTimeReserveMillis = minOf(
+            requestAverageProcessingTime.toMillis() * 2L,
+            (totalBudgetMillis * 9L / 10L).coerceAtLeast(1L),
+        )
+
+        if (rejectIfTooLate(paymentId, paymentStartedAt, deadline, paymentTimeReserveMillis)) {
             return
         }
 
@@ -61,21 +67,21 @@ class PaymentExternalSystemAdapterImpl(
         val semaphoreWaitMillis = (waitUntilMillis - now()).coerceAtLeast(0L)
 
         if (!semaphore.tryAcquire(semaphoreWaitMillis, TimeUnit.MILLISECONDS)) {
-            rejectIfTooLate(paymentId, paymentStartedAt, deadline)
+            recordSkippedPayment(paymentId, paymentStartedAt)
             return
         }
 
         try {
             if (!rateLimiter.tickBlocking(waitUntilMillis)) {
-                rejectIfTooLate(paymentId, paymentStartedAt, deadline)
+                recordSkippedPayment(paymentId, paymentStartedAt)
                 return
             }
 
-            if (rejectIfTooLate(paymentId, paymentStartedAt, deadline)) {
+            if (rejectIfTooLate(paymentId, paymentStartedAt, deadline, paymentTimeReserveMillis)) {
                 return
             }
 
-            logger.warn("[$accountName] Submitting payment request for payment $paymentId")
+            logger.debug("[$accountName] Submitting payment request for payment $paymentId")
 
             val transactionId = UUID.randomUUID()
 
@@ -88,7 +94,7 @@ class PaymentExternalSystemAdapterImpl(
                 )
             }
 
-            logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
+            logger.debug("[$accountName] Submit: $paymentId , txId: $transactionId")
 
             try {
                 val request = Request.Builder().run {
@@ -98,7 +104,9 @@ class PaymentExternalSystemAdapterImpl(
 
                 paymentMetrics.recordOutgoing(accountName)
 
-                client.newCall(request).execute().use { response ->
+                val call = client.newCall(request)
+                call.timeout().timeout((deadline - now()).coerceAtLeast(1L), TimeUnit.MILLISECONDS)
+                call.execute().use { response ->
                     val body = try {
                         mapper.readValue(
                             response.body?.string(),
@@ -117,7 +125,7 @@ class PaymentExternalSystemAdapterImpl(
                         )
                     }
 
-                    logger.warn(
+                    logger.debug(
                         "[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}"
                     )
 
@@ -189,6 +197,7 @@ class PaymentExternalSystemAdapterImpl(
         paymentId: UUID,
         paymentStartedAt: Long,
         deadline: Long,
+        paymentTimeReserveMillis: Long,
     ): Boolean {
         val checkedAt = now()
         val remainingMillis = deadline - checkedAt
@@ -197,6 +206,13 @@ class PaymentExternalSystemAdapterImpl(
             return false
         }
 
+        recordSkippedPayment(paymentId, paymentStartedAt)
+
+        return true
+    }
+
+    private fun recordSkippedPayment(paymentId: UUID, paymentStartedAt: Long) {
+        val checkedAt = now()
         val transactionId = UUID.randomUUID()
 
         paymentESService.update(paymentId) {
@@ -220,11 +236,11 @@ class PaymentExternalSystemAdapterImpl(
         }
 
         paymentMetrics.recordCompleted(accountName, success = false)
-
-        return true
     }
 
     override fun price() = properties.price
+
+    override fun parallelRequests() = properties.parallelRequests
 
     override fun isEnabled() = properties.enabled
 
