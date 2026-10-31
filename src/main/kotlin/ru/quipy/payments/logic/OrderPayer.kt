@@ -7,12 +7,15 @@ import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.beans.factory.annotation.Value
 import org.springframework.stereotype.Service
 import ru.quipy.apigateway.APIController.OrderStatus
+import ru.quipy.common.utils.LeakingBucketRateLimiter
 import ru.quipy.common.utils.NamedThreadFactory
 import ru.quipy.core.EventSourcingService
 import ru.quipy.orders.repository.OrderRepository
 import ru.quipy.payments.api.PaymentAggregate
+import java.time.Duration
 import java.util.*
 import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import kotlin.math.ceil
@@ -22,7 +25,7 @@ import kotlin.math.min
 @Service
 class OrderPayer(
     paymentAccountProperties: List<PaymentAccountProperties>,
-    @Value("\${payment.max-queue-wait-seconds:0.5}")
+    @Value("\${payment.max-queue-wait-seconds:23}")
     maxQueueWaitSeconds: Double,
 ) {
 
@@ -61,8 +64,14 @@ class OrderPayer(
         val accountProcessingSeconds = it.averageProcessingTime.toMillis() / 1000.0
         min(it.rateLimitPerSec.toDouble(), it.parallelRequests / accountProcessingSeconds)
     }
-    private val workerCount = ceil(effectiveRps * averageProcessingSeconds).toInt().coerceAtLeast(1)
+    private val workerCount = ceil(effectiveRps * averageProcessingSeconds * 1.2).toInt().coerceAtLeast(1)
     private val queueCapacity = floor(effectiveRps * maxQueueWaitSeconds).toInt().coerceAtLeast(1)
+
+    private val incomingRateLimiter = LeakingBucketRateLimiter(
+        rate = paymentAccountProperties.minOf { it.rateLimitPerSec }.toLong(),
+        window = Duration.ofSeconds(1),
+        bucketSize = queueCapacity + paymentAccountProperties.minOf { it.rateLimitPerSec },
+    )
 
     private val paymentExecutor = ThreadPoolExecutor(
         workerCount,
@@ -81,6 +90,9 @@ class OrderPayer(
 
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
         paymentMetrics.recordIncoming()
+        if (!incomingRateLimiter.tick()) {
+            throw RejectedExecutionException("Payment admission rate limit exceeded")
+        }
         val createdAt = System.currentTimeMillis()
         paymentExecutor.submit {
             val order = orderRepository.findById(orderId)
