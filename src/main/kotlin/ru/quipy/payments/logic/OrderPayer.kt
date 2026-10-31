@@ -8,11 +8,14 @@ import org.springframework.beans.factory.annotation.Value
 import org.springframework.stereotype.Service
 import ru.quipy.apigateway.APIController.OrderStatus
 import ru.quipy.common.utils.NamedThreadFactory
+import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.orders.repository.OrderRepository
 import ru.quipy.payments.api.PaymentAggregate
+import java.time.Duration
 import java.util.*
 import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import kotlin.math.ceil
@@ -64,6 +67,11 @@ class OrderPayer(
     private val workerCount = ceil(effectiveRps * averageProcessingSeconds).toInt().coerceAtLeast(1)
     private val queueCapacity = floor(effectiveRps * maxQueueWaitSeconds).toInt().coerceAtLeast(1)
 
+    private val incomingRateLimiter = SlidingWindowRateLimiter(
+        rate = paymentAccountProperties.minOf { it.rateLimitPerSec }.toLong(),
+        window = Duration.ofSeconds(1),
+    )
+
     private val paymentExecutor = ThreadPoolExecutor(
         workerCount,
         workerCount,
@@ -81,6 +89,9 @@ class OrderPayer(
 
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
         paymentMetrics.recordIncoming()
+        if (!incomingRateLimiter.tick()) {
+            throw RejectedExecutionException("Payment admission rate limit exceeded")
+        }
         val createdAt = System.currentTimeMillis()
         paymentExecutor.submit {
             val order = orderRepository.findById(orderId)
