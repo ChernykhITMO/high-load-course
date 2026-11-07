@@ -35,7 +35,7 @@ class PaymentExternalSystemAdapterImpl(
     private val serviceName = properties.serviceName
     private val accountName = properties.accountName
     private val requestAverageProcessingTime = properties.averageProcessingTime
-    private val paymentTimeReserveMillis = requestAverageProcessingTime.toMillis() * 2L
+    private val paymentTimeReserveMillis = requestAverageProcessingTime.toMillis()
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
 
@@ -58,130 +58,150 @@ class PaymentExternalSystemAdapterImpl(
 
         val waitUntilMillis = deadline - paymentTimeReserveMillis
 
-        val semaphoreWaitMillis = (waitUntilMillis - now()).coerceAtLeast(0L)
+        logger.warn("[$accountName] Submitting payment request for payment $paymentId")
 
-        if (!semaphore.tryAcquire(semaphoreWaitMillis, TimeUnit.MILLISECONDS)) {
-            rejectIfTooLate(paymentId, paymentStartedAt, deadline)
-            return
-        }
+        val transactionId = UUID.randomUUID()
 
         try {
-            if (!rateLimiter.tickBlocking(waitUntilMillis)) {
-                rejectIfTooLate(paymentId, paymentStartedAt, deadline)
-                return
-            }
+            val request = Request.Builder().run {
+                url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
+                post(emptyBody)
+            }.build()
 
-            if (rejectIfTooLate(paymentId, paymentStartedAt, deadline)) {
-                return
-            }
+            repeat(3) { attempt ->
+                if (attempt > 0) {
+                    Thread.sleep(50L * attempt)
+                }
 
-            logger.warn("[$accountName] Submitting payment request for payment $paymentId")
+                if (rejectIfTooLate(paymentId, paymentStartedAt, deadline)) {
+                    return
+                }
 
-            val transactionId = UUID.randomUUID()
+                val semaphoreWaitMillis = (waitUntilMillis - now()).coerceAtLeast(0L)
+                if (!semaphore.tryAcquire(semaphoreWaitMillis, TimeUnit.MILLISECONDS)) {
+                    rejectIfTooLate(paymentId, paymentStartedAt, deadline)
+                    return
+                }
 
-            paymentESService.update(paymentId) {
-                it.logSubmission(
-                    success = true,
-                    transactionId,
-                    now(),
-                    Duration.ofMillis(now() - paymentStartedAt),
-                )
-            }
-
-            logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
-
-            try {
-                val request = Request.Builder().run {
-                    url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
-                    post(emptyBody)
-                }.build()
-
-                paymentMetrics.recordOutgoing(accountName)
-
-                client.newCall(request).execute().use { response ->
-                    val body = try {
-                        mapper.readValue(
-                            response.body?.string(),
-                            ExternalSysResponse::class.java,
-                        )
-                    } catch (e: Exception) {
-                        logger.error(
-                            "[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${e.message}",
-                            e,
-                        )
-                        ExternalSysResponse(
-                            transactionId.toString(),
-                            paymentId.toString(),
-                            false,
-                            e.message,
-                        )
+                try {
+                    if (!rateLimiter.tickBlocking(waitUntilMillis)) {
+                        rejectIfTooLate(paymentId, paymentStartedAt, deadline)
+                        return
                     }
 
-                    logger.warn(
-                        "[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}"
+                    if (rejectIfTooLate(paymentId, paymentStartedAt, deadline)) {
+                        return
+                    }
+
+                    if (attempt == 0) {
+                        paymentESService.update(paymentId) {
+                            it.logSubmission(
+                                success = true,
+                                transactionId,
+                                now(),
+                                Duration.ofMillis(now() - paymentStartedAt),
+                            )
+                        }
+
+                        logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
+                    }
+
+                    val clientWithTimeout = client.newBuilder()
+                        .callTimeout(Duration.ofMillis((deadline - now()).coerceAtLeast(1L)))
+                        .build()
+
+                    paymentMetrics.recordOutgoing(accountName)
+
+                    clientWithTimeout.newCall(request).execute().use { response ->
+                        val body = try {
+                            mapper.readValue(
+                                response.body?.string(),
+                                ExternalSysResponse::class.java,
+                            )
+                        } catch (e: Exception) {
+                            logger.error(
+                                "[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${e.message}",
+                                e,
+                            )
+                            ExternalSysResponse(
+                                transactionId.toString(),
+                                paymentId.toString(),
+                                false,
+                                e.message,
+                            )
+                        }
+
+                        logger.warn(
+                            "[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}"
+                        )
+
+                        if (!body.result && body.message == "Temporary error" && attempt < 2) {
+                            return@repeat
+                        }
+
+                        paymentESService.update(paymentId) {
+                            it.logProcessing(
+                                body.result,
+                                now(),
+                                transactionId,
+                                reason = body.message,
+                            )
+                        }
+
+                        paymentMetrics.recordCompleted(
+                            accountName,
+                            success = body.result,
+                        )
+                    }
+                    return
+                } finally {
+                    semaphore.release()
+                }
+            }
+        } catch (e: Exception) {
+            when (e) {
+                is SocketTimeoutException -> {
+                    logger.error(
+                        "[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId",
+                        e,
                     )
 
                     paymentESService.update(paymentId) {
                         it.logProcessing(
-                            body.result,
+                            false,
                             now(),
                             transactionId,
-                            reason = body.message,
+                            reason = "Request timeout.",
                         )
                     }
 
                     paymentMetrics.recordCompleted(
                         accountName,
-                        success = body.result,
+                        success = false,
                     )
                 }
-            } catch (e: Exception) {
-                when (e) {
-                    is SocketTimeoutException -> {
-                        logger.error(
-                            "[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId",
-                            e,
-                        )
 
-                        paymentESService.update(paymentId) {
-                            it.logProcessing(
-                                false,
-                                now(),
-                                transactionId,
-                                reason = "Request timeout.",
-                            )
-                        }
+                else -> {
+                    logger.error(
+                        "[$accountName] Payment failed for txId: $transactionId, payment: $paymentId",
+                        e,
+                    )
 
-                        paymentMetrics.recordCompleted(
-                            accountName,
-                            success = false,
+                    paymentESService.update(paymentId) {
+                        it.logProcessing(
+                            false,
+                            now(),
+                            transactionId,
+                            reason = e.message,
                         )
                     }
 
-                    else -> {
-                        logger.error(
-                            "[$accountName] Payment failed for txId: $transactionId, payment: $paymentId",
-                            e,
-                        )
-
-                        paymentESService.update(paymentId) {
-                            it.logProcessing(
-                                false,
-                                now(),
-                                transactionId,
-                                reason = e.message,
-                            )
-                        }
-
-                        paymentMetrics.recordCompleted(
-                            accountName,
-                            success = false,
-                        )
-                    }
+                    paymentMetrics.recordCompleted(
+                        accountName,
+                        success = false,
+                    )
                 }
             }
-        } finally {
-            semaphore.release()
         }
     }
 
