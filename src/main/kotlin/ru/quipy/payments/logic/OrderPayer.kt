@@ -31,6 +31,7 @@ class OrderPayer(
 
     companion object {
         val logger: Logger = LoggerFactory.getLogger(OrderPayer::class.java)
+        private const val ADMISSION_WAIT_MILLIS = 50L
     }
 
     @Autowired
@@ -89,10 +90,11 @@ class OrderPayer(
 
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
         paymentMetrics.recordIncoming()
-        if (!incomingRateLimiter.tick()) {
+        val createdAt = System.currentTimeMillis()
+        val admissionDeadline = minOf(deadline, createdAt + ADMISSION_WAIT_MILLIS)
+        if (!incomingRateLimiter.tick() && !incomingRateLimiter.tickBlocking(admissionDeadline)) {
             throw RejectedExecutionException("Payment admission rate limit exceeded")
         }
-        val createdAt = System.currentTimeMillis()
         paymentExecutor.submit {
             val order = orderRepository.findById(orderId)
                 ?: throw IllegalArgumentException("No such order $orderId")
