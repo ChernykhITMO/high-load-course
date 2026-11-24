@@ -9,6 +9,8 @@ import org.slf4j.LoggerFactory
 import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
+import java.io.IOException
+import java.io.InterruptedIOException
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
@@ -30,16 +32,20 @@ class PaymentExternalSystemAdapterImpl(
 
         val emptyBody = RequestBody.create(null, ByteArray(0))
         val mapper = ObjectMapper().registerKotlinModule()
+        private const val RESPONSE_GRACE_MILLIS = 200L
     }
 
     private val serviceName = properties.serviceName
     private val accountName = properties.accountName
     private val requestAverageProcessingTime = properties.averageProcessingTime
     private val paymentTimeReserveMillis = requestAverageProcessingTime.toMillis()
+    private val providerAttemptTimeoutMillis = paymentTimeReserveMillis.takeIf { accountName == "acc-7" }
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
 
-    private val client = OkHttpClient.Builder().build()
+    private val client = OkHttpClient.Builder()
+        .retryOnConnectionFailure(providerAttemptTimeoutMillis == null)
+        .build()
     private val rateLimiter = SlidingWindowRateLimiter(
         rate = rateLimitPerSec.toLong(),
         window = Duration.ofSeconds(1)
@@ -68,28 +74,30 @@ class PaymentExternalSystemAdapterImpl(
                 post(emptyBody)
             }.build()
 
+            var retryAfter: PaymentCallOutcome? = null
             repeat(3) { attempt ->
                 if (attempt > 0) {
                     Thread.sleep(50L * attempt)
                 }
 
-                if (rejectIfTooLate(paymentId, paymentStartedAt, deadline)) {
+                val submittedTransactionId = transactionId.takeIf { attempt > 0 && providerAttemptTimeoutMillis != null }
+                if (rejectIfTooLate(paymentId, paymentStartedAt, deadline, submittedTransactionId)) {
                     return
                 }
 
                 val semaphoreWaitMillis = (waitUntilMillis - now()).coerceAtLeast(0L)
                 if (!semaphore.tryAcquire(semaphoreWaitMillis, TimeUnit.MILLISECONDS)) {
-                    rejectIfTooLate(paymentId, paymentStartedAt, deadline)
+                    rejectIfTooLate(paymentId, paymentStartedAt, deadline, submittedTransactionId)
                     return
                 }
 
                 try {
                     if (!rateLimiter.tickBlocking(waitUntilMillis)) {
-                        rejectIfTooLate(paymentId, paymentStartedAt, deadline)
+                        rejectIfTooLate(paymentId, paymentStartedAt, deadline, submittedTransactionId)
                         return
                     }
 
-                    if (rejectIfTooLate(paymentId, paymentStartedAt, deadline)) {
+                    if (rejectIfTooLate(paymentId, paymentStartedAt, deadline, submittedTransactionId)) {
                         return
                     }
 
@@ -106,53 +114,85 @@ class PaymentExternalSystemAdapterImpl(
                         logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
                     }
 
-                    val clientWithTimeout = client.newBuilder()
-                        .callTimeout(Duration.ofMillis((deadline - now()).coerceAtLeast(1L)))
-                        .build()
+                    val remainingMillis = (deadline - now()).coerceAtLeast(1L)
+                    val providerTimeoutMillis = providerAttemptTimeoutMillis?.let {
+                        minOf(it, (remainingMillis - RESPONSE_GRACE_MILLIS).coerceAtLeast(1L))
+                    }
+                    val requestWithTimeout = providerTimeoutMillis?.let {
+                        val url = request.url.newBuilder()
+                            .addQueryParameter("timeout", Duration.ofMillis(it).toString())
+                            .build()
+                        request.newBuilder().url(url).build()
+                    } ?: request
+                    val clientTimeoutMillis = providerTimeoutMillis?.let {
+                        minOf(remainingMillis, it + RESPONSE_GRACE_MILLIS)
+                    } ?: remainingMillis
+                    val call = client.newCall(requestWithTimeout)
+                    call.timeout().timeout(clientTimeoutMillis, TimeUnit.MILLISECONDS)
 
-                    paymentMetrics.recordOutgoing(accountName)
-
-                    clientWithTimeout.newCall(request).execute().use { response ->
-                        val body = try {
-                            mapper.readValue(
-                                response.body?.string(),
-                                ExternalSysResponse::class.java,
-                            )
-                        } catch (e: Exception) {
-                            logger.error(
-                                "[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${e.message}",
-                                e,
-                            )
-                            ExternalSysResponse(
-                                transactionId.toString(),
-                                paymentId.toString(),
-                                false,
-                                e.message,
-                            )
+                    paymentMetrics.recordOutgoing(accountName, retryAfter)
+                    val startedAt = System.nanoTime()
+                    val (status, body) = try {
+                        call.execute().use { response ->
+                            val responseBody = response.body?.string()
+                            val body = try {
+                                mapper.readValue(responseBody, ExternalSysResponse::class.java)
+                                    ?: throw IOException("Null payment provider response")
+                            } catch (e: Exception) {
+                                logger.error(
+                                    "[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${e.message}",
+                                    e,
+                                )
+                                ExternalSysResponse(
+                                    transactionId.toString(),
+                                    paymentId.toString(),
+                                    false,
+                                    e.message,
+                                )
+                            }
+                            response.code to body
                         }
-
-                        logger.warn(
-                            "[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}"
-                        )
-
-                        if (!body.result && body.message == "Temporary error" && attempt < 2) {
-                            return@repeat
-                        }
-
-                        paymentESService.update(paymentId) {
-                            it.logProcessing(
-                                body.result,
-                                now(),
-                                transactionId,
-                                reason = body.message,
-                            )
-                        }
-
-                        paymentMetrics.recordCompleted(
+                    } catch (e: IOException) {
+                        val timedOut = e is SocketTimeoutException || (e is InterruptedIOException && call.isCanceled())
+                        paymentMetrics.recordCallDuration(
                             accountName,
-                            success = body.result,
+                            if (timedOut) PaymentCallOutcome.CLIENT_TIMEOUT else PaymentCallOutcome.FAILED,
+                            Duration.ofNanos(System.nanoTime() - startedAt),
+                        )
+                        throw e
+                    }
+
+                    val outcome = when {
+                        body.result -> PaymentCallOutcome.SUCCESS
+                        providerTimeoutMillis != null && status == 408 && body.message == "Timeout" ->
+                            PaymentCallOutcome.PROVIDER_TIMEOUT
+                        body.message == "Temporary error" -> PaymentCallOutcome.TEMPORARY_ERROR
+                        else -> PaymentCallOutcome.FAILED
+                    }
+                    paymentMetrics.recordCallDuration(accountName, outcome, Duration.ofNanos(System.nanoTime() - startedAt))
+
+                    logger.warn(
+                        "[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}"
+                    )
+
+                    if (outcome.retryable && attempt < 2) {
+                        retryAfter = outcome
+                        return@repeat
+                    }
+
+                    paymentESService.update(paymentId) {
+                        it.logProcessing(
+                            body.result,
+                            now(),
+                            transactionId,
+                            reason = body.message,
                         )
                     }
+
+                    paymentMetrics.recordCompleted(
+                        accountName,
+                        success = body.result,
+                    )
                     return
                 } finally {
                     semaphore.release()
@@ -209,6 +249,7 @@ class PaymentExternalSystemAdapterImpl(
         paymentId: UUID,
         paymentStartedAt: Long,
         deadline: Long,
+        submittedTransactionId: UUID? = null,
     ): Boolean {
         val checkedAt = now()
         val remainingMillis = deadline - checkedAt
@@ -217,17 +258,19 @@ class PaymentExternalSystemAdapterImpl(
             return false
         }
 
-        val transactionId = UUID.randomUUID()
+        val transactionId = submittedTransactionId ?: UUID.randomUUID()
 
-        paymentESService.update(paymentId) {
-            it.logSubmission(
-                success = false,
-                transactionId = transactionId,
-                startedAt = checkedAt,
-                spentInQueueDuration = Duration.ofMillis(
-                    checkedAt - paymentStartedAt
-                ),
-            )
+        if (submittedTransactionId == null) {
+            paymentESService.update(paymentId) {
+                it.logSubmission(
+                    success = false,
+                    transactionId = transactionId,
+                    startedAt = checkedAt,
+                    spentInQueueDuration = Duration.ofMillis(
+                        checkedAt - paymentStartedAt
+                    ),
+                )
+            }
         }
 
         paymentESService.update(paymentId) {
