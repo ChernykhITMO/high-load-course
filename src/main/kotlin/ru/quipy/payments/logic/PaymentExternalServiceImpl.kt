@@ -33,6 +33,7 @@ class PaymentExternalSystemAdapterImpl(
         val emptyBody = RequestBody.create(null, ByteArray(0))
         val mapper = ObjectMapper().registerKotlinModule()
         private const val RESPONSE_GRACE_MILLIS = 200L
+        private const val ACC_9_OUTGOING_RATE_LIMIT_PER_SEC = 110
     }
 
     private val serviceName = properties.serviceName
@@ -40,7 +41,11 @@ class PaymentExternalSystemAdapterImpl(
     private val requestAverageProcessingTime = properties.averageProcessingTime
     private val paymentTimeReserveMillis = requestAverageProcessingTime.toMillis()
     private val providerAttemptTimeoutMillis = paymentTimeReserveMillis.takeIf { accountName == "acc-7" }
-    private val rateLimitPerSec = properties.rateLimitPerSec
+    private val rateLimitPerSec = if (accountName == "acc-9") {
+        minOf(properties.rateLimitPerSec, ACC_9_OUTGOING_RATE_LIMIT_PER_SEC)
+    } else {
+        properties.rateLimitPerSec
+    }
     private val parallelRequests = properties.parallelRequests
 
     private val client = OkHttpClient.Builder()
