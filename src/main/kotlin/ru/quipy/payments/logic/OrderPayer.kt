@@ -25,13 +25,13 @@ import kotlin.math.min
 @Service
 class OrderPayer(
     paymentAccountProperties: List<PaymentAccountProperties>,
-    @Value("\${payment.max-queue-wait-seconds:0.5}")
+    @Value("\${payment.max-queue-wait-seconds:6.0}")
     maxQueueWaitSeconds: Double,
 ) {
 
     companion object {
         val logger: Logger = LoggerFactory.getLogger(OrderPayer::class.java)
-        private const val ADMISSION_WAIT_MILLIS = 50L
+        private const val ADMISSION_WAIT_MILLIS = 250L
     }
 
     @Autowired
